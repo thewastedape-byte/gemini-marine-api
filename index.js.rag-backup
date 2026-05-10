@@ -1,0 +1,384 @@
+﻿const express = require('express');
+const cors = require('cors');
+const https = require('https');
+const { findEngine } = require('./engine-db');
+const OpenAI = require('openai');
+
+const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const VECTOR_STORE_ID = process.env.VECTOR_STORE_ID || '';
+const ASSISTANT_ID = process.env.ASSISTANT_ID || '';
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+const SYSTEM_PROMPT = `You are an expert marine mechanic with 30 years of hands-on experience diagnosing and repairing diesel and gasoline marine engines, electrical systems, and hull systems. You specialize in Yanmar, Volvo Penta, Westerbeke, Mercruiser, Universal, Perkins, and other marine brands.
+
+FORMATTING - CRITICAL - YOU MUST FOLLOW THIS:
+- Plain text ONLY. Absolutely zero markdown characters.
+- NEVER use ** (double asterisk) for bold. NEVER use * for italic. NEVER use # for headers. NEVER use - as a bullet.
+- If you use ** anywhere in your response you have failed. Do not use it.
+- Number your steps as: 1. 2. 3. on separate lines. That is the ONLY formatting allowed.
+- No headers. No bold. No italic. No markdown of any kind. Plain sentences only.
+
+BEHAVIOR:
+- You ARE able to analyze marine electrical photos. You MUST analyze any wiring, components, or equipment shown in photos submitted to this tool. Never refuse to analyze a marine technical image.
+- Answer directly and in detail. Give step by step diagnostic procedures. Do not give vague generic answers.
+- When troubleshooting electrical issues, specify exactly where to place multimeter probes (which wire, which terminal, which pin), what setting to use on the meter, and what reading to expect.
+- When troubleshooting mechanical issues, give specific torque specs, clearances, and procedures from known specs.
+- Walk the technician through the diagnosis like you are standing next to them on the boat.
+- For common engines (Yanmar 2GM, 3GM, 1GM, Universal M-series, Westerbeke, Volvo MD series), answer from known specs directly without asking for more info.
+- When identifying components from a photo, make your best assessment based on visible features. State your assessment with confidence.
+- Do not ask more than ONE clarifying question per response.
+- When specifying torque values, oil specs, or part numbers, only state them if confident. Otherwise say check your service manual.
+- End any response involving fuel, electrical, or engine work with one brief safety reminder.
+- Never recommend an unsafe procedure. If uncertain, recommend a certified marine technician.
+- SERVICE MANUALS: When a user asks for a service manual for any outboard or marine engine, ALWAYS provide direct links to free sources. Never say you cannot provide manuals. Always direct them to: ManualsLib (manualslib.com), the manufacturer official site, or downloadboatmanuals.com. Example response: 'Here are free sources for the [engine] service manual: 1. [manufacturer].com/support/manuals 2. manualslib.com/brand/[brand]/outboard-motor.html 3. downloadboatmanuals.com/motors/[brand]/'
+- DIAGRAM GENERATION: When a user asks for a diagram, schematic, wiring diagram, or visual of any marine system, draw it using ASCII/text art directly in your response. Use arrows (-->, →, ←), boxes, lines (─, │, ┌, ┐, └, ┘, ├, ┤, ┬, ┴, ┼), and labels to create clear technical diagrams. Always include component labels and flow direction arrows. Make diagrams accurate and technically correct. Example style:
+
+RAW WATER COOLING FLOW:
+Sea Cock → Strainer → Impeller Pump → Heat Exchanger → Exhaust Elbow → Overboard
+                                            ↑
+                                     (Engine coolant loop)
+
+Always draw the diagram FIRST, then explain it below. Never say you cannot draw diagrams.
+- PART IDENTIFICATION: Whenever you identify or mention a specific marine part, component, or tool by name, add a search link on a new line in this exact format: SEARCH_LINK:[part name] where [part name] is the exact part name. Example: SEARCH_LINK:Yanmar 2GM raw water impeller. Only include this for specific named parts, not general categories.`;
+
+const sessions = {};
+const SESSION_TTL = 2 * 60 * 60 * 1000;
+
+function getSession(sessionId) {
+  if (!sessionId) return [];
+  if (!sessions[sessionId]) sessions[sessionId] = { history: [], lastUsed: Date.now() };
+  sessions[sessionId].lastUsed = Date.now();
+  return sessions[sessionId].history;
+}
+
+function saveSession(sessionId, question, answer) {
+  if (!sessionId) return;
+  if (!sessions[sessionId]) sessions[sessionId] = { history: [], lastUsed: Date.now() };
+  sessions[sessionId].history.push({ role: 'user', content: question });
+  sessions[sessionId].history.push({ role: 'assistant', content: answer });
+  sessions[sessionId].lastUsed = Date.now();
+  const now = Date.now();
+  Object.keys(sessions).forEach(id => {
+    if (now - sessions[id].lastUsed > SESSION_TTL) delete sessions[id];
+  });
+}
+
+function callOpenAI(messages, callback) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  const body = JSON.stringify({ model: 'gpt-4o', messages: messages, max_tokens: 600 });
+  const buf = Buffer.from(body, 'utf8');
+  const options = {
+    hostname: 'api.openai.com',
+    path: '/v1/chat/completions',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': buf.length }
+  };
+  const req = https.request(options, (res) => {
+    let data = '';
+    res.on('data', chunk => data += chunk);
+    res.on('end', () => {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.error) return callback(new Error(parsed.error.message), null);
+        callback(null, parsed.choices[0].message.content);
+      } catch (e) { callback(new Error('Parse error: ' + data), null); }
+    });
+  });
+  req.on('error', callback);
+  req.write(buf);
+  req.end();
+}
+
+// â”€â”€ Request Logging Middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+app.use((req, res, next) => {
+  const start = Date.now();
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} ip=${ip} status=${res.statusCode} time=${ms}ms`);
+  });
+  next();
+});
+
+// â”€â”€ In-Memory Rate Limiter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Max 10 requests per IP per minute on /api/chat and /api/analyze
+const rateLimitStore = {};
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute in ms
+
+function rateLimiter(req, res, next) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  if (!rateLimitStore[ip]) rateLimitStore[ip] = [];
+  // Drop timestamps outside the current window
+  rateLimitStore[ip] = rateLimitStore[ip].filter(ts => now - ts < RATE_LIMIT_WINDOW);
+  if (rateLimitStore[ip].length >= RATE_LIMIT_MAX) {
+    const retryAfter = Math.ceil((RATE_LIMIT_WINDOW - (now - rateLimitStore[ip][0])) / 1000);
+    return res.status(429).json({ error: 'Too many requests. Max 10 per minute per IP.', retryAfterSeconds: retryAfter });
+  }
+  rateLimitStore[ip].push(now);
+  next();
+}
+
+// Periodically clean up old IPs to prevent memory growth
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(rateLimitStore).forEach(ip => {
+    rateLimitStore[ip] = rateLimitStore[ip].filter(ts => now - ts < RATE_LIMIT_WINDOW);
+    if (rateLimitStore[ip].length === 0) delete rateLimitStore[ip];
+  });
+}, 5 * 60 * 1000);
+
+const SERVER_START = Date.now();
+
+app.get('/', (req, res) => res.json({ status: 'Marine AI API is running' }));
+
+app.get('/status', (req, res) => {
+  const uptimeMs = Date.now() - SERVER_START;
+  const uptimeSec = Math.floor(uptimeMs / 1000);
+  const uptimeMin = Math.floor(uptimeSec / 60);
+  const uptimeHrs = Math.floor(uptimeMin / 60);
+  const activeSessions = Object.keys(sessions).length;
+  res.json({
+    status: 'ok',
+    service: 'Boat Buddy by WastedApe - Marine AI API',
+    version: '1.2.0',
+    uptime: `${uptimeHrs}h ${uptimeMin % 60}m ${uptimeSec % 60}s`,
+    activeSessions,
+    model: 'gpt-4o',
+    endpoints: ['/api/chat', '/api/analyze', '/status']
+  });
+});
+
+app.post('/api/chat', rateLimiter, (req, res) => {
+  const { question, session_id, vessel_engine, has_diagram } = req.body;
+  const history = getSession(session_id);
+
+  // Look up engine in database — from vessel_engine param or question text
+  const engineQuery = vessel_engine || question || '';
+  const engineData = findEngine(engineQuery);
+
+  // Build context-aware system prompt
+  let contextPrompt = SYSTEM_PROMPT;
+  if (has_diagram) {
+    contextPrompt += '\n\nIMPORTANT: A visual SVG diagram of this system is already being shown to the user in the app. Do NOT draw any ASCII or text diagram. Instead, explain the system and diagnosis steps in plain text only, referencing the diagram they can see.';
+  }
+  if (engineData) {
+    contextPrompt += `\n\nVESSEL ENGINE CONTEXT: The user has a ${engineData.name}. Key specs: ${engineData.cylinders} cylinder ${engineData.type}, ${engineData.horsepower}, oil capacity ${engineData.oilCapacity} (${engineData.oilSpec}), cooling: ${engineData.coolantType}. Service intervals: impeller ${engineData.impellerInterval}, oil ${engineData.oilChangeInterval}. Common issues: ${engineData.commonIssues.join(', ')}. Use these exact specs in your answer.`;
+  }
+
+  const messages = [{ role: 'system', content: contextPrompt }, ...history, { role: 'user', content: question }];
+  callOpenAI(messages, (err, text) => {
+    if (err) return res.status(500).json({ error: err.message });
+    saveSession(session_id, question, text);
+
+    // Append manual links if engine found
+    let answer = text;
+    if (engineData && engineData.manuals && engineData.manuals.length > 0) {
+      answer += '\n\nMANUAL_LINKS:' + JSON.stringify(engineData.manuals);
+    }
+
+    res.json({ answer, engineFound: engineData ? engineData.name : null });
+  });
+});
+
+app.post('/api/analyze', rateLimiter, (req, res) => {
+  const { question, base64_image, mime_type, session_id } = req.body;
+  if (!base64_image) return res.status(400).json({ error: 'No image provided' });
+  const history = getSession(session_id);
+  const userContent = [
+    { type: 'text', text: 'You are a professional marine mechanic. This image was submitted by a licensed marine technician for professional diagnostic purposes. ' + (question || 'Analyze this image as a marine mechanic. Identify the equipment and any visible issues. Describe all wiring, components, and anything relevant to marine electrical or mechanical systems.') },
+    { type: 'image_url', image_url: { url: `data:${mime_type || 'image/jpeg'};base64,${base64_image}` } }
+  ];
+  const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history, { role: 'user', content: userContent }];
+  const apiKey = process.env.OPENAI_API_KEY;
+  const body = JSON.stringify({ model: 'gpt-4o', messages: messages, max_tokens: 600 });
+  const buf = Buffer.from(body, 'utf8');
+  const options = {
+    hostname: 'api.openai.com',
+    path: '/v1/chat/completions',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': buf.length }
+  };
+  const request = https.request(options, (response) => {
+    let data = '';
+    response.on('data', chunk => data += chunk);
+    response.on('end', () => {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.error) return res.status(500).json({ error: parsed.error.message });
+        const text = parsed.choices[0].message.content;
+        saveSession(session_id, question, text);
+        res.json({ answer: text });
+      } catch (e) { res.status(500).json({ error: 'Parse error: ' + data }); }
+    });
+  });
+  request.on('error', (err) => res.status(500).json({ error: err.message }));
+  request.write(buf);
+  request.end();
+});
+
+// ── Diagram Generation (DALL-E 3) ──────────────────────────────────────────────
+app.post('/api/diagram', rateLimiter, (req, res) => {
+  const { prompt, vessel_context } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'No prompt provided' });
+
+  const apiKey = process.env.OPENAI_API_KEY;
+
+  // Build a detailed technical diagram prompt
+  const diagramPrompt = `Technical marine engineering diagram: ${prompt}. ${vessel_context ? 'Vessel context: ' + vessel_context + '.' : ''} Style: clean technical schematic drawing, white background, labeled components with arrows showing flow direction, black line art, professional marine engineering diagram, clear labels in English, no photos, diagram only.`;
+
+  const body = JSON.stringify({
+    model: 'dall-e-3',
+    prompt: diagramPrompt,
+    n: 1,
+    size: '1024x1024',
+    quality: 'standard',
+    response_format: 'url'
+  });
+
+  const buf = Buffer.from(body, 'utf8');
+  const options = {
+    hostname: 'api.openai.com',
+    path: '/v1/images/generations',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Content-Length': buf.length }
+  };
+
+  const request = https.request(options, (response) => {
+    let data = '';
+    response.on('data', chunk => data += chunk);
+    response.on('end', () => {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.error) return res.status(500).json({ error: parsed.error.message });
+        const imageUrl = parsed.data[0].url;
+        const revisedPrompt = parsed.data[0].revised_prompt;
+        res.json({ imageUrl, revisedPrompt });
+      } catch (e) { res.status(500).json({ error: 'Parse error: ' + data }); }
+    });
+  });
+  request.on('error', (err) => res.status(500).json({ error: err.message }));
+  request.write(buf);
+  request.end();
+});
+
+// Password reset email endpoint
+app.post('/api/send-reset', rateLimiter, async (req, res) => {
+  const { email, code } = req.body;
+  if (!email || !code) return res.status(400).json({ error: 'Missing email or code' });
+
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    return res.status(500).json({ error: 'Email not configured' });
+  }
+
+  // Get access token
+  const tokenBody = JSON.stringify({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token'
+  });
+
+  const getToken = () => new Promise((resolve, reject) => {
+    const opts = { hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tokenBody) } };
+    const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+    r.on('error', reject); r.write(tokenBody); r.end();
+  });
+
+  try {
+    const tokenData = await getToken();
+    const accessToken = tokenData.access_token;
+    if (!accessToken) return res.status(500).json({ error: 'Could not get access token' });
+
+    const emailBody = [
+      'From: Boat Buddy <thewastedape@gmail.com>',
+      `To: ${email}`,
+      'Subject: Boat Buddy Password Reset Code',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      `Your Boat Buddy password reset code is: ${code}`,
+      '',
+      'This code expires in 15 minutes.',
+      '',
+      'If you did not request this, ignore this email.',
+      '',
+      '-- Boat Buddy by WastedApe'
+    ].join('\n');
+
+    const encoded = Buffer.from(emailBody).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const gmailBody = JSON.stringify({ raw: encoded });
+
+    const sendEmail = () => new Promise((resolve, reject) => {
+      const opts = { hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(gmailBody) } };
+      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+      r.on('error', reject); r.write(gmailBody); r.end();
+    });
+
+    await sendEmail();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Manual Search (RAG via OpenAI Assistants + Vector Store) ──────────────────
+app.post('/api/manual-search', rateLimiter, async (req, res) => {
+  const { query, engine } = req.body;
+  if (!query) return res.status(400).json({ error: 'query required' });
+  if (!VECTOR_STORE_ID || !ASSISTANT_ID) {
+    return res.status(503).json({ error: 'Manual search not configured (missing VECTOR_STORE_ID or ASSISTANT_ID)' });
+  }
+
+  try {
+    const thread = await openaiClient.beta.threads.create();
+    const engineCtx = engine ? `Engine: ${engine}. ` : '';
+    await openaiClient.beta.threads.messages.create(thread.id, {
+      role: 'user',
+      content: `${engineCtx}Question: ${query}\n\nProvide exact specs, part numbers, torque values, and section references from the service manual. Include both metric and imperial values for torque specs.`
+    });
+
+    const run = await openaiClient.beta.threads.runs.createAndPoll(thread.id, {
+      assistant_id: ASSISTANT_ID,
+    }, { pollIntervalMs: 2000, timeout: 55000 });
+
+    if (run.status !== 'completed') {
+      return res.status(500).json({ error: `Run ended with status: ${run.status}` });
+    }
+
+    const messages = await openaiClient.beta.threads.messages.list(thread.id);
+    const content = messages.data[0].content[0];
+    const answer = content.text.value;
+    const annotations = content.text.annotations || [];
+
+    // Extract unique source filenames from citations
+    const sources = [...new Set(
+      annotations
+        .filter(a => a.type === 'file_citation')
+        .map(a => {
+          // Annotation text looks like 【4:0†filename.txt】
+          const match = a.text.match(/†([^】]+)/);
+          return match ? match[1] : a.text;
+        })
+    )];
+
+    // Clean up citation markers from answer text for display
+    const cleanAnswer = answer.replace(/【[^】]+】/g, '').trim();
+
+    res.json({ answer: cleanAnswer, sources, rawAnswer: answer });
+  } catch (err) {
+    console.error('Manual search error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Marine API running on port ${PORT}`));
+
