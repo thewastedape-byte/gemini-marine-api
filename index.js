@@ -1,6 +1,8 @@
 ﻿const express = require('express');
 const cors = require('cors');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { findEngine } = require('./engine-db');
 const OpenAI = require('openai');
 const { createClient } = require('@supabase/supabase-js');
@@ -46,27 +48,66 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Traffic counter
-const stats = {
-  startTime: Date.now(),
-  totalRequests: 0,
-  chatRequests: 0,
-  analyzeRequests: 0,
-  manualSearchRequests: 0,
-  uniqueSessions: new Set(),
-  dailyCounts: {},
-};
+// Persistent Traffic Analytics
+const TRAFFIC_FILE = path.join(__dirname, 'traffic-data.json');
+const _sessionsSeen = new Set();
+const _ipsSeen = new Set();
 
-function trackRequest(type, sessionId) {
-  stats.totalRequests++;
-  if (type === 'chat') stats.chatRequests++;
-  if (type === 'analyze') stats.analyzeRequests++;
-  if (type === 'manual') stats.manualSearchRequests++;
-  if (sessionId) stats.uniqueSessions.add(sessionId);
-  const day = new Date().toISOString().split('T')[0];
-  stats.dailyCounts[day] = (stats.dailyCounts[day] || 0) + 1;
-  // Also persist to Supabase
-  // trackEvent for persistent analytics - coming soon
+function loadTrafficData() {
+  try {
+    if (fs.existsSync(TRAFFIC_FILE)) {
+      const raw = fs.readFileSync(TRAFFIC_FILE, 'utf8');
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.warn('[analytics] Could not load traffic-data.json:', e.message);
+  }
+  return {
+    totalRequests: 0,
+    chatRequests: 0,
+    photoAnalysis: 0,
+    manualSearch: 0,
+    uniqueSessions: 0,
+    uniqueIPs: 0,
+    dailyBreakdown: {},
+    lastUpdated: null,
+  };
+}
+
+function saveTrafficData() {
+  try {
+    persistentStats.lastUpdated = new Date().toISOString();
+    fs.writeFileSync(TRAFFIC_FILE, JSON.stringify(persistentStats, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[analytics] Could not save traffic-data.json:', e.message);
+  }
+}
+
+const persistentStats = loadTrafficData();
+const _startTime = Date.now();
+
+function trackRequest(type, sessionId, ip) {
+  const today = new Date().toISOString().split('T')[0];
+  persistentStats.totalRequests++;
+  if (type === 'chat') persistentStats.chatRequests++;
+  if (type === 'analyze') persistentStats.photoAnalysis++;
+  if (type === 'manual') persistentStats.manualSearch++;
+  if (sessionId && !_sessionsSeen.has(sessionId)) {
+    _sessionsSeen.add(sessionId);
+    persistentStats.uniqueSessions++;
+  }
+  if (ip && ip !== 'unknown' && !_ipsSeen.has(ip)) {
+    _ipsSeen.add(ip);
+    persistentStats.uniqueIPs++;
+  }
+  if (!persistentStats.dailyBreakdown[today]) {
+    persistentStats.dailyBreakdown[today] = { total: 0, chat: 0, analyze: 0, manual: 0 };
+  }
+  persistentStats.dailyBreakdown[today].total++;
+  if (type === 'chat') persistentStats.dailyBreakdown[today].chat = (persistentStats.dailyBreakdown[today].chat || 0) + 1;
+  if (type === 'analyze') persistentStats.dailyBreakdown[today].analyze = (persistentStats.dailyBreakdown[today].analyze || 0) + 1;
+  if (type === 'manual') persistentStats.dailyBreakdown[today].manual = (persistentStats.dailyBreakdown[today].manual || 0) + 1;
+  saveTrafficData();
 }
 
 const SYSTEM_PROMPT = `You are an expert marine mechanic with 30 years of hands-on experience diagnosing and repairing diesel and gasoline marine engines, electrical systems, and hull systems. You specialize in Yanmar, Volvo Penta, Westerbeke, Mercruiser, Universal, Perkins, and other marine brands.
@@ -204,28 +245,49 @@ app.get('/status', (req, res) => {
   res.json({
     status: 'ok',
     service: 'Boat Buddy by WastedApe - Marine AI API',
-    version: '1.3.0',
+    version: '1.4.0',
     uptime: `${uptimeHrs}h ${uptimeMin % 60}m ${uptimeSec % 60}s`,
     activeSessions,
     model: 'gpt-4o',
     traffic: {
-      totalRequests: stats.totalRequests,
-      chatRequests: stats.chatRequests,
-      photoAnalysis: stats.analyzeRequests,
-      manualSearch: stats.manualSearchRequests,
-      uniqueSessions: stats.uniqueSessions.size,
-      todayRequests: stats.dailyCounts[today] || 0,
-      yesterdayRequests: stats.dailyCounts[yesterday] || 0,
-      dailyBreakdown: stats.dailyCounts
+      totalRequests: persistentStats.totalRequests,
+      chatRequests: persistentStats.chatRequests,
+      photoAnalysis: persistentStats.photoAnalysis,
+      manualSearch: persistentStats.manualSearch,
+      uniqueSessions: persistentStats.uniqueSessions,
+      uniqueIPs: persistentStats.uniqueIPs,
+      todayRequests: (persistentStats.dailyBreakdown[today] || {}).total || 0,
+      yesterdayRequests: (persistentStats.dailyBreakdown[yesterday] || {}).total || 0,
+      dailyBreakdown: persistentStats.dailyBreakdown,
+      lastUpdated: persistentStats.lastUpdated,
     },
     dbConfigured: !!(process.env.SUPABASE_URL),
-    endpoints: ['/api/chat', '/api/analyze', '/api/manual-search', '/api/db/vessels', '/api/db/jobs', '/api/db/customers', '/api/db/parts', '/api/db/webhooks', '/status']
+    endpoints: ['/api/chat', '/api/analyze', '/api/manual-search', '/api/db/vessels', '/api/db/jobs', '/api/db/customers', '/api/db/parts', '/api/db/webhooks', '/status', '/stats']
+  });
+});
+
+app.get('/stats', (req, res) => {
+  const today = new Date().toISOString().split('T')[0];
+  const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+  res.json({
+    service: 'Boat Buddy by WastedApe - Marine AI API',
+    totalRequests: persistentStats.totalRequests,
+    chatRequests: persistentStats.chatRequests,
+    photoAnalysis: persistentStats.photoAnalysis,
+    manualSearch: persistentStats.manualSearch,
+    uniqueSessions: persistentStats.uniqueSessions,
+    uniqueIPs: persistentStats.uniqueIPs,
+    todayRequests: (persistentStats.dailyBreakdown[today] || {}).total || 0,
+    yesterdayRequests: (persistentStats.dailyBreakdown[yesterday] || {}).total || 0,
+    dailyBreakdown: persistentStats.dailyBreakdown,
+    lastUpdated: persistentStats.lastUpdated,
   });
 });
 
 app.post('/api/chat', rateLimiter, (req, res) => {
   const { question, session_id, vessel_engine, has_diagram, language } = req.body;
-  trackRequest('chat', session_id);
+  const _reqIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  trackRequest('chat', session_id, _reqIp);
   const history = getSession(session_id);
 
   // Look up engine in database — from vessel_engine param or question text
@@ -265,7 +327,8 @@ app.post('/api/chat', rateLimiter, (req, res) => {
 
 app.post('/api/analyze', rateLimiter, (req, res) => {
   const { question, base64_image, mime_type, session_id } = req.body;
-  trackRequest('analyze', session_id);
+  const _analyzeIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  trackRequest('analyze', session_id, _analyzeIp);
   if (!base64_image) return res.status(400).json({ error: 'No image provided' });
   const history = getSession(session_id);
   const userContent = [
@@ -465,7 +528,8 @@ app.post('/api/send-reset', rateLimiter, async (req, res) => {
 // ── Manual Search (RAG via OpenAI Assistants + Vector Store) ──────────────────
 app.post('/api/manual-search', rateLimiter, async (req, res) => {
   const { query, engine } = req.body;
-  trackRequest('manual', null);
+  const _manualIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  trackRequest('manual', null, _manualIp);
   if (!query) return res.status(400).json({ error: 'query required' });
   if (!VECTOR_STORE_ID || !ASSISTANT_ID) {
     return res.status(503).json({ error: 'Manual search not configured (missing VECTOR_STORE_ID or ASSISTANT_ID)' });
@@ -1045,10 +1109,19 @@ app.post('/api/invites/:token/accept', async (req, res) => {
 });
 
 // ============================================================
-// Analytics endpoints (in-memory, persistent coming later)
-app.get('/api/analytics', (req, res) => res.json({ inMemory: traffic }));
-app.post('/api/analytics/pageview', (req, res) => res.json({ ok: true }));
-app.post('/api/analytics/signup', (req, res) => res.json({ ok: true }));
+// Analytics endpoints
+app.get('/api/analytics', (req, res) => res.json(persistentStats));
+app.post('/api/analytics/pageview', (req, res) => {
+  const { page } = req.body || {};
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  trackRequest('pageview', page || 'unknown', ip);
+  res.json({ ok: true });
+});
+app.post('/api/analytics/signup', (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  trackRequest('signup', null, ip);
+  res.json({ ok: true });
+});
 
 // On startup, try to create messages table
 ensureMessagesTable().then(ok => console.log(ok ? 'Messages table ready' : 'Messages table: manual setup needed'));
