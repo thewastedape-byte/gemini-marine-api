@@ -462,6 +462,80 @@ app.post('/api/contact', rateLimiter, async (req, res) => {
   }
 });
 
+// Email open tracking pixel
+const emailOpenLog = {};
+app.get('/api/track-open/:trackId', (req, res) => {
+  const { trackId } = req.params;
+  const now = new Date().toISOString();
+  if (!emailOpenLog[trackId]) {
+    emailOpenLog[trackId] = { opens: 0, firstOpen: now, lastOpen: now };
+  }
+  emailOpenLog[trackId].opens++;
+  emailOpenLog[trackId].lastOpen = now;
+  // Notify Dan via Telegram
+  const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+  const tgChatId = '8590935363';
+  if (tgToken) {
+    const msg = encodeURIComponent(`📧 Email opened! Track ID: ${trackId}\nFirst open: ${emailOpenLog[trackId].firstOpen}\nTotal opens: ${emailOpenLog[trackId].opens}`);
+    https.get(`https://api.telegram.org/bot${tgToken}/sendMessage?chat_id=${tgChatId}&text=${msg}`, () => {});
+  }
+  // Return 1x1 transparent GIF
+  const pixel = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  res.writeHead(200, { 'Content-Type': 'image/gif', 'Content-Length': pixel.length, 'Cache-Control': 'no-store' });
+  res.end(pixel);
+});
+
+// Check email open status
+app.get('/api/track-open/:trackId/status', (req, res) => {
+  const { trackId } = req.params;
+  res.json(emailOpenLog[trackId] || { opens: 0 });
+});
+
+// Send outreach email with tracking
+app.post('/api/send-outreach', async (req, res) => {
+  const { to, subject, body, trackId } = req.body;
+  if (!to || !subject || !body) return res.status(400).json({ error: 'Missing fields' });
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (!clientId || !clientSecret || !refreshToken) return res.status(500).json({ error: 'Email not configured' });
+  const tokenBody = JSON.stringify({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' });
+  const getToken = () => new Promise((resolve, reject) => {
+    const opts = { hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tokenBody) } };
+    const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+    r.on('error', reject); r.write(tokenBody); r.end();
+  });
+  try {
+    const tokenData = await getToken();
+    const accessToken = tokenData.access_token;
+    if (!accessToken) return res.status(500).json({ error: 'Could not get access token' });
+    const apiBase = process.env.API_BASE_URL || 'https://gemini-marine-api.onrender.com';
+    const pixelUrl = trackId ? `${apiBase}/api/track-open/${trackId}` : null;
+    const htmlBody = body.replace(/\n/g, '<br>') + (pixelUrl ? `<img src="${pixelUrl}" width="1" height="1" style="display:none" />` : '');
+    const boundary = 'boundary_' + Date.now();
+    const emailBody = [
+      'From: Daniel Bloom <thewastedape@gmail.com>',
+      `To: ${to}`,
+      `Subject: ${subject}`,
+      'MIME-Version: 1.0',
+      `Content-Type: text/html; charset=utf-8`,
+      '',
+      htmlBody
+    ].join('\r\n');
+    const encoded = Buffer.from(emailBody).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const gmailBody = JSON.stringify({ raw: encoded });
+    const sendEmail = () => new Promise((resolve, reject) => {
+      const opts = { hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(gmailBody) } };
+      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+      r.on('error', reject); r.write(gmailBody); r.end();
+    });
+    await sendEmail();
+    res.json({ success: true, trackId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Password reset email endpoint
 app.post('/api/send-reset', rateLimiter, async (req, res) => {
   const { email, code } = req.body;
