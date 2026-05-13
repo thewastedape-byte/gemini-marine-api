@@ -508,7 +508,7 @@ app.post('/api/send-outreach', async (req, res) => {
   try {
     const tokenData = await getToken();
     const accessToken = tokenData.access_token;
-    if (!accessToken) return res.status(500).json({ error: 'Could not get access token' });
+    if (!accessToken) return res.status(500).json({ error: 'Could not get access token', detail: tokenData });
     const apiBase = process.env.API_BASE_URL || 'https://gemini-marine-api.onrender.com';
     const pixelUrl = trackId ? `${apiBase}/api/track-open/${trackId}` : null;
     const htmlBody = body.replace(/\n/g, '<br>') + (pixelUrl ? `<img src="${pixelUrl}" width="1" height="1" style="display:none" />` : '');
