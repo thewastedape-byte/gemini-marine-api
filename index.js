@@ -462,6 +462,36 @@ app.post('/api/contact', rateLimiter, async (req, res) => {
   }
 });
 
+// OAuth callback - exchanges code for refresh token
+app.get('/oauth/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send('No code provided');
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const tokenBody = JSON.stringify({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: 'https://gemini-marine-api.onrender.com/oauth/callback', grant_type: 'authorization_code' });
+  const getToken = () => new Promise((resolve, reject) => {
+    const opts = { hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tokenBody) } };
+    const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+    r.on('error', reject); r.write(tokenBody); r.end();
+  });
+  try {
+    const tokenData = await getToken();
+    if (tokenData.refresh_token) {
+      // Notify Dan via Telegram
+      const tgToken = process.env.TELEGRAM_BOT_TOKEN;
+      if (tgToken) {
+        const msg = encodeURIComponent('✅ Gmail OAuth success! New refresh token: ' + tokenData.refresh_token);
+        https.get('https://api.telegram.org/bot' + tgToken + '/sendMessage?chat_id=8590935363&text=' + msg, () => {});
+      }
+      res.send('<h2>✅ Gmail authorized!</h2><p>Refresh token sent to your Telegram. You can close this tab.</p><pre>' + tokenData.refresh_token + '</pre>');
+    } else {
+      res.send('<h2>❌ No refresh token returned</h2><pre>' + JSON.stringify(tokenData) + '</pre>');
+    }
+  } catch (err) {
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
 // Email open tracking pixel
 const emailOpenLog = {};
 app.get('/api/track-open/:trackId', (req, res) => {
