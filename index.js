@@ -285,7 +285,7 @@ app.get('/stats', (req, res) => {
 });
 
 app.post('/api/chat', rateLimiter, (req, res) => {
-  const { question, session_id, vessel_engine, has_diagram, language } = req.body;
+  const { question, session_id, vessel_engine, has_diagram, language, user_email } = req.body;
   const _reqIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   trackRequest('chat', session_id, _reqIp);
   const history = getSession(session_id);
@@ -314,6 +314,7 @@ app.post('/api/chat', rateLimiter, (req, res) => {
   callOpenAI(messages, (err, text) => {
     if (err) return res.status(500).json({ error: err.message });
     saveSession(session_id, question, text);
+    logQuestion({ user_email, session_id, question, answer: text, engine_found: engineData ? engineData.name : null, ip: _reqIp, language });
 
     // Append manual links if engine found
     let answer = text;
@@ -354,6 +355,7 @@ app.post('/api/analyze', rateLimiter, (req, res) => {
         if (parsed.error) return res.status(500).json({ error: parsed.error.message });
         const text = parsed.choices[0].message.content;
         saveSession(session_id, question, text);
+    logQuestion({ user_email, session_id, question, answer: text, engine_found: engineData ? engineData.name : null, ip: _reqIp, language });
         res.json({ answer: text });
       } catch (e) { res.status(500).json({ error: 'Parse error: ' + data }); }
     });
@@ -991,6 +993,37 @@ async function ensureMessagesTable() {
   });
 }
 
+async function ensureQuestionsTable() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return false;
+  const sql = `CREATE TABLE IF NOT EXISTS questions (id uuid DEFAULT gen_random_uuid() PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT now(), user_email TEXT, session_id TEXT, question TEXT, answer TEXT, engine_found TEXT, ip TEXT, language TEXT); CREATE INDEX IF NOT EXISTS questions_email_idx ON questions(user_email); CREATE INDEX IF NOT EXISTS questions_created_at_idx ON questions(created_at DESC);`;
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ query: sql });
+    const host = new URL(url).hostname;
+    const req = require('https').request({ hostname: host, path: '/rest/v1/rpc/exec_sql', method: 'POST', headers: { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, res => { resolve(res.statusCode < 400); res.resume(); });
+    req.on('error', () => resolve(false)); req.write(body); req.end();
+  });
+}
+
+async function logQuestion({ user_email, session_id, question, answer, engine_found, ip, language }) {
+  const sb = getSupabase();
+  if (!sb) return;
+  try {
+    await sb.from('questions').insert({
+      user_email: user_email || null,
+      session_id: session_id || null,
+      question: question || null,
+      answer: answer || null,
+      engine_found: engine_found || null,
+      ip: ip || null,
+      language: language || null,
+    });
+  } catch(e) {
+    console.warn('[questions] Failed to log question:', e.message);
+  }
+}
+
 // GET messages for a team
 app.get('/api/messages', async (req, res) => {
   const sb = getSupabase(); if (!sb) return dbNotConfigured(res);
@@ -1229,6 +1262,7 @@ app.post('/api/analytics/signup', (req, res) => {
 
 // On startup, try to create messages table
 ensureMessagesTable().then(ok => console.log(ok ? 'Messages table ready' : 'Messages table: manual setup needed'));
+ensureQuestionsTable().then(ok => console.log(ok ? 'Questions table ready' : 'Questions table: manual setup needed'));
 
 // Analytics table init - deferred until table is created in Supabase
 
