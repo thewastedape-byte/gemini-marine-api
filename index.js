@@ -327,7 +327,7 @@ app.post('/api/chat', rateLimiter, (req, res) => {
 });
 
 app.post('/api/analyze', rateLimiter, (req, res) => {
-  const { question, base64_image, mime_type, session_id } = req.body;
+  const { question, base64_image, mime_type, session_id, email: user_email, language } = req.body;
   const _analyzeIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   trackRequest('analyze', session_id, _analyzeIp);
   if (!base64_image) return res.status(400).json({ error: 'No image provided' });
@@ -355,7 +355,7 @@ app.post('/api/analyze', rateLimiter, (req, res) => {
         if (parsed.error) return res.status(500).json({ error: parsed.error.message });
         const text = parsed.choices[0].message.content;
         saveSession(session_id, question, text);
-    logQuestion({ user_email, session_id, question, answer: text, engine_found: engineData ? engineData.name : null, ip: _reqIp, language });
+    logQuestion({ user_email, session_id, question, answer: text, engine_found: null, ip: _analyzeIp, language: language || 'en' });
         res.json({ answer: text });
       } catch (e) { res.status(500).json({ error: 'Parse error: ' + data }); }
     });
@@ -1268,4 +1268,5 @@ ensureQuestionsTable().then(ok => console.log(ok ? 'Questions table ready' : 'Qu
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Marine API running on port ${PORT}`));
+
 
