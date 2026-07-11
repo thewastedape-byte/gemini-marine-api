@@ -164,6 +164,47 @@ function saveSession(sessionId, question, answer) {
   });
 }
 
+// ============================================================
+// Brave Search — fetch top service manual results for a query
+async function searchManualContent(engineName, question) {
+  const apiKey = process.env.BRAVE_SEARCH_API_KEY;
+  if (!apiKey) return null;
+  const q = encodeURIComponent(`${engineName ? engineName + ' ' : ''}${question} marine service manual repair`);
+  return new Promise((resolve) => {
+    const options = {
+      hostname: 'api.search.brave.com',
+      path: `/res/v1/web/search?q=${q}&count=3&search_lang=en`,
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Accept-Encoding': 'gzip',
+        'X-Subscription-Token': apiKey
+      }
+    };
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString());
+          const results = (data.web && data.web.results) ? data.web.results.slice(0, 3) : [];
+          if (!results.length) return resolve(null);
+          const snippets = results.map(r => `- ${r.title}: ${r.description || ''} (${r.url})`).join('\n');
+          resolve(snippets);
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+// Detect questions that would benefit from real manual data
+function needsManualSearch(question) {
+  const q = question.toLowerCase();
+  return /torque|spec|procedure|step.by.step|how (do|to)|service manual|oil change|impeller|flush|bleed|adjust|clearance|interval|capacity|replace|remove|install|change|winterize|coolant|gear.?lube|filter|belt|valve|timing|compression|calibrat|rebuild|overhaul/.test(q);
+}
+
 function callOpenAI(messages, callback) {
   const apiKey = process.env.OPENAI_API_KEY;
   const body = JSON.stringify({ model: 'gpt-4o', messages: messages, max_tokens: 600 });
@@ -284,8 +325,8 @@ app.get('/stats', (req, res) => {
   });
 });
 
-app.post('/api/chat', rateLimiter, (req, res) => {
-  const { question, session_id, vessel_engine, has_diagram, language, email: user_email } = req.body;
+app.post('/api/chat', rateLimiter, async (req, res) => {
+  const { question, session_id, vessel_engine, has_diagram, language, email: user_email, subscription } = req.body;
   const _reqIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   trackRequest('chat', session_id, _reqIp);
   const history = getSession(session_id);
@@ -310,6 +351,18 @@ app.post('/api/chat', rateLimiter, (req, res) => {
     contextPrompt += `\n\nVESSEL ENGINE CONTEXT: The user has a ${engineData.name}. Key specs: ${engineData.cylinders} cylinder ${engineData.type}, ${engineData.horsepower}, oil capacity ${engineData.oilCapacity} (${engineData.oilSpec}), cooling: ${engineData.coolantType}. Service intervals: impeller ${engineData.impellerInterval}, oil ${engineData.oilChangeInterval}. Common issues: ${engineData.commonIssues.join(', ')}. Use these exact specs in your answer.`;
   }
 
+  // Web search for paid tiers on technical questions
+  const PAID_TIERS = ['first_mate', 'captain', 'admiral'];
+  const isPaid = PAID_TIERS.includes(subscription);
+  let searchContext = null;
+  if (isPaid && needsManualSearch(question)) {
+    const engineName = engineData ? engineData.name : (vessel_engine || '');
+    searchContext = await searchManualContent(engineName, question);
+  }
+  if (searchContext) {
+    contextPrompt += `\n\nWEB SEARCH RESULTS (live service manual sources — use these for precise specs and procedures):\n${searchContext}\n\nUse relevant data from the above in your answer. Cite the source when referencing specific specs.`;
+  }
+
   const messages = [{ role: 'system', content: contextPrompt }, ...history, { role: 'user', content: question }];
   callOpenAI(messages, (err, text) => {
     if (err) return res.status(500).json({ error: err.message });
@@ -322,7 +375,12 @@ app.post('/api/chat', rateLimiter, (req, res) => {
       answer += '\n\nMANUAL_LINKS:' + JSON.stringify(engineData.manuals);
     }
 
-    res.json({ answer, engineFound: engineData ? engineData.name : null });
+    // Free tier upsell on technical questions
+    if (!isPaid && needsManualSearch(question)) {
+      answer += '\n\n⛵ *Want more precise answers with real torque specs and procedures from actual service manuals? Upgrade to First Mate or above.*';
+    }
+
+    res.json({ answer, engineFound: engineData ? engineData.name : null, webSearched: !!(isPaid && searchContext) });
   });
 });
 
