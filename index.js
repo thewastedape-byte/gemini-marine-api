@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const fs = require('fs');
@@ -512,7 +512,7 @@ app.post('/api/contact', rateLimiter, async (req, res) => {
     const gmailBody = JSON.stringify({ raw: encoded });
     const sendEmail = () => new Promise((resolve, reject) => {
       const opts = { hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(gmailBody) } };
-      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => { try { const p = JSON.parse(d); if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(p); else reject(new Error((p.error && p.error.message) || JSON.stringify(p))); } catch(e) { reject(e); } }); });
       r.on('error', reject); r.write(gmailBody); r.end();
     });
     await sendEmail();
@@ -616,7 +616,7 @@ app.post('/api/send-outreach', async (req, res) => {
     const gmailBody = JSON.stringify({ raw: encoded });
     const sendEmail = () => new Promise((resolve, reject) => {
       const opts = { hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(gmailBody) } };
-      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => { try { const p = JSON.parse(d); if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(p); else reject(new Error((p.error && p.error.message) || JSON.stringify(p))); } catch(e) { reject(e); } }); });
       r.on('error', reject); r.write(gmailBody); r.end();
     });
     await sendEmail();
@@ -678,7 +678,7 @@ app.post('/api/send-reset', rateLimiter, async (req, res) => {
 
     const sendEmail = () => new Promise((resolve, reject) => {
       const opts = { hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST', headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(gmailBody) } };
-      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(JSON.parse(d))); });
+      const r = https.request(opts, resp => { let d = ''; resp.on('data', c => d += c); resp.on('end', () => { try { const p = JSON.parse(d); if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(p); else reject(new Error((p.error && p.error.message) || JSON.stringify(p))); } catch(e) { reject(e); } }); });
       r.on('error', reject); r.write(gmailBody); r.end();
     });
 
