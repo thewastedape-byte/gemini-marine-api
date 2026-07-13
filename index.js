@@ -950,12 +950,59 @@ app.post('/api/send-invite', rateLimiter, async (req, res) => {
 
 // Send invoice email to customer
 app.post('/api/send-invoice', rateLimiter, async (req, res) => {
-  const { to, customerName, shopName, shopPhone, shopAddress, workOrderNum, vessel, problemDesc, parts, laborDesc, laborHours, laborRate, laborTotal, partsTotal, grandTotal, techName, date } = req.body;
+  const { to, fromEmail, appPassword, customerName, shopName, shopPhone, shopAddress, workOrderNum, vessel, problemDesc, parts, laborDesc, laborHours, laborRate, laborTotal, partsTotal, grandTotal, techName, date } = req.body;
   if (!to) return res.status(400).json({ error: 'Missing recipient email' });
+
+  // If user provided their own credentials, use Nodemailer directly
+  if (fromEmail && appPassword) {
+    try {
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: fromEmail, pass: appPassword }
+      });
+      const partsLines = (parts || []).filter(p => p.description).map(p =>
+        `  ${p.description} x${p.qty} @ $${parseFloat(p.price||0).toFixed(2)} = $${(parseFloat(p.qty||1)*parseFloat(p.price||0)).toFixed(2)}`
+      ).join('\n');
+      const text = [
+        `${shopName || fromEmail}`,
+        shopPhone || '', shopAddress || '', '',
+        'WORK ORDER / INVOICE',
+        `Work Order #: ${workOrderNum || 'N/A'}`,
+        `Date: ${date || new Date().toLocaleDateString()}`,
+        `Customer: ${customerName || to}`, '',
+        'VESSEL', vessel || 'N/A', '',
+        'PROBLEM / SYMPTOM', problemDesc || 'N/A', '',
+        partsLines ? `PARTS / MATERIALS\n${partsLines}` : '',
+        laborDesc ? `LABOR\n${laborDesc}` : '',
+        laborHours ? `Hours: ${laborHours} @ $${laborRate}/hr = $${laborTotal}` : '', '',
+        '─────────────────────────',
+        `Parts Subtotal: $${partsTotal || '0.00'}`,
+        laborTotal ? `Labor Total: $${laborTotal}` : '',
+        `TOTAL DUE: $${grandTotal || '0.00'}`,
+        '─────────────────────────', '',
+        techName ? `Technician: ${techName}` : '',
+        'Thank you for your business.',
+        `-- ${shopName || fromEmail}`,
+        'Powered by Boat Buddy by WastedApe | boatbuddy.thewastedape.com',
+      ].filter(l => l !== null && l !== undefined).join('\n');
+      await transporter.sendMail({
+        from: `${shopName || 'Boat Buddy Marine'} <${fromEmail}>`,
+        to,
+        subject: `Work Order ${workOrderNum || ''} — ${shopName || 'Boat Buddy Marine'}`,
+        text
+      });
+      return res.json({ success: true });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // Fallback: use shared Gmail OAuth (legacy)
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-  if (!clientId) return res.status(500).json({ error: 'Email not configured' });
+  if (!clientId) return res.status(500).json({ error: 'Email not configured. Please set up email credentials in Settings.' });
   const tokenBody = JSON.stringify({ client_id: clientId, client_secret: clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' });
   const getToken = () => new Promise((resolve, reject) => {
     const opts = { hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tokenBody) } };
