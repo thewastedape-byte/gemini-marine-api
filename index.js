@@ -326,10 +326,22 @@ app.get('/stats', (req, res) => {
 });
 
 app.post('/api/chat', rateLimiter, async (req, res) => {
-  const { question, session_id, vessel_engine, has_diagram, language, email: user_email, subscription } = req.body;
+  const { question, session_id, vessel_engine, has_diagram, language, email: user_email, subscription: clientSubscription } = req.body;
   const _reqIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   trackRequest('chat', session_id, _reqIp);
   const history = getSession(session_id);
+
+  // Always verify subscription from DB (client-sent value is untrusted fallback)
+  let subscription = clientSubscription || 'stow_away';
+  if (user_email) {
+    try {
+      const sb = getSupabase();
+      if (sb) {
+        const { data: dbUser } = await sb.from('users').select('subscription').eq('email', user_email).single();
+        if (dbUser && dbUser.subscription) subscription = dbUser.subscription;
+      }
+    } catch(e) { /* fallback to client value */ }
+  }
 
   // Look up engine in database — from vessel_engine param or question text
   const engineQuery = vessel_engine || question || '';
@@ -1069,7 +1081,13 @@ app.post('/api/db/users/sync', async (req, res) => {
   const sb = getSupabase(); if (!sb) return dbNotConfigured(res);
   const { email, name, subscription } = req.body;
   if (!email) return res.status(400).json({error: 'email required'});
-  const { data, error } = await sb.from('users').upsert({email, name, subscription: subscription || 'stow_away'}, {onConflict: 'email'}).select().single();
+  // Don't overwrite an existing subscription with the default - fetch first
+  let finalSubscription = subscription;
+  if (!subscription) {
+    const { data: existing } = await sb.from('users').select('subscription').eq('email', email).single().catch(() => ({ data: null }));
+    finalSubscription = existing?.subscription || 'stow_away';
+  }
+  const { data, error } = await sb.from('users').upsert({email, name, subscription: finalSubscription}, {onConflict: 'email'}).select().single();
   if (error) return res.status(400).json({error: error.message});
   res.json(data);
 });
