@@ -1082,12 +1082,10 @@ app.post('/api/db/users/sync', async (req, res) => {
   const { email, name, subscription } = req.body;
   if (!email) return res.status(400).json({error: 'email required'});
   // Don't overwrite an existing subscription with the default - fetch first
-  let finalSubscription = subscription;
-  if (!subscription) {
-    const { data: existing } = await sb.from('users').select('subscription').eq('email', email).single().catch(() => ({ data: null }));
-    finalSubscription = existing?.subscription || 'stow_away';
-  }
-  const { data, error } = await sb.from('users').upsert({email, name, subscription: finalSubscription}, {onConflict: 'email'}).select().single();
+  // Never overwrite an admin-set subscription — fetch existing first
+  const { data: existing } = await sb.from('users').select('subscription').eq('email', email).maybeSingle();
+  const safeSubscription = existing?.subscription && existing.subscription !== 'stow_away' ? existing.subscription : (subscription || 'stow_away');
+  const { data, error } = await sb.from('users').upsert({email, name, subscription: safeSubscription}, {onConflict: 'email'}).select().single();
   if (error) return res.status(400).json({error: error.message});
   res.json(data);
 });
