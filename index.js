@@ -772,7 +772,11 @@ app.get('/api/db/vessels', async (req, res) => {
 });
 app.post('/api/db/vessels', async (req, res) => {
   const sb = getSupabase(); if (!sb) return dbNotConfigured(res);
-  const { data, error } = await sb.from('vessels').insert(req.body).select().single();
+  const body = { ...req.body };
+  // Strip non-UUID ids — Supabase expects proper UUID format
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (body.id && !uuidRe.test(body.id)) delete body.id;
+  const { data, error } = await sb.from('vessels').insert(body).select().single();
   if (error) return res.status(400).json({error: error.message});
   res.json(data);
 });
