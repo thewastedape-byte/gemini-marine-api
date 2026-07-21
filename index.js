@@ -746,7 +746,13 @@ app.post('/api/manual-search', rateLimiter, async (req, res) => {
     // Clean up citation markers from answer text for display
     const cleanAnswer = answer.replace(/【[^】]+】/g, '').trim();
 
-    res.json({ answer: cleanAnswer, sources, rawAnswer: answer });
+    // Also include engine manual links if engine is recognized
+    const engineData = engine ? findEngine(engine) : null;
+    const manualLinks = (engineData && engineData.manuals && engineData.manuals.length > 0)
+      ? engineData.manuals
+      : [];
+
+    res.json({ answer: cleanAnswer, sources, rawAnswer: answer, manualLinks });
   } catch (err) {
     console.error('Manual search error:', err);
     res.status(500).json({ error: err.message });
