@@ -1391,6 +1391,27 @@ app.post('/api/analytics/signup', (req, res) => {
   res.json({ ok: true });
 });
 
+
+// -- User Storage (cloud persistence for offline-first pages) ------------------
+app.get('/api/db/storage', async (req, res) => {
+  const sb = getSupabase(); if (!sb) return dbNotConfigured(res);
+  const { user_email, key } = req.query;
+  if (!user_email || !key) return res.status(400).json({ error: 'user_email and key required' });
+  const { data, error } = await sb.from('user_storage').select('data').eq('user_email', user_email).eq('key', key).maybeSingle();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ data: data?.data ?? null });
+});
+
+app.put('/api/db/storage', async (req, res) => {
+  const sb = getSupabase(); if (!sb) return dbNotConfigured(res);
+  const { user_email, key, data } = req.body;
+  if (!user_email || !key) return res.status(400).json({ error: 'user_email and key required' });
+  const { data: result, error } = await sb.from('user_storage')
+    .upsert({ user_email, key, data, updated_at: new Date().toISOString() }, { onConflict: 'user_email,key' })
+    .select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(result);
+});
 // On startup, try to create messages table
 ensureMessagesTable().then(ok => console.log(ok ? 'Messages table ready' : 'Messages table: manual setup needed'));
 ensureQuestionsTable().then(ok => console.log(ok ? 'Questions table ready' : 'Questions table: manual setup needed'));
