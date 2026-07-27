@@ -330,6 +330,7 @@ app.get('/stats', (req, res) => {
 
 app.post('/api/chat', rateLimiter, async (req, res) => {
   const { question, session_id, vessel_engine, has_diagram, language, email: user_email, subscription: clientSubscription } = req.body;
+  if (!question) return res.status(400).json({ error: 'question is required' });
   const _reqIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   trackRequest('chat', session_id, _reqIp);
   const history = getSession(session_id);
